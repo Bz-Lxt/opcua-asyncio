@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import collections.abc
+import contextlib
+import contextvars
 import dataclasses
 import inspect
 import logging
@@ -38,6 +40,18 @@ from asyncua import ua
 from asyncua.crypto.permission_rules import User, UserRole
 
 _logger = logging.getLogger(__name__)
+
+_HAS_PROPERTY_NODEID = ua.NodeId(ua.ObjectIds.HasProperty)
+_HAS_TYPE_DEFINITION_NODEID = ua.NodeId(ua.ObjectIds.HasTypeDefinition)
+_NODE_VERSION_BROWSE_NAME = ua.QualifiedName("NodeVersion", 0)
+
+
+@dataclasses.dataclass(slots=True)
+class _CollectedModelChange:
+    verb: int = 0
+    ref_targets: set[ua.NodeId] = dataclasses.field(default_factory=set)
+    affected_type: ua.NodeId | None = None
+    had_node_version: bool = False
 
 
 class AttributeValue:
@@ -262,8 +276,9 @@ class NodeManagementService:
         self, addnodeitems: list[ua.AddNodesItem], user: User = User(role=UserRole.Admin)
     ) -> list[ua.AddNodesResult]:
         results: list[ua.AddNodesResult] = []
-        for item in addnodeitems:
-            results.append(self._add_node(item, user))
+        with self._aspace.model_change_transaction():
+            for item in addnodeitems:
+                results.append(self._add_node(item, user))
         return results
 
     def try_add_nodes(
@@ -351,6 +366,14 @@ class NodeManagementService:
         result.StatusCode = ua.StatusCode()
         result.AddedNodeId = nodedata.nodeid
 
+        self._aspace.record_model_change(nodedata.nodeid, int(ua.ModelChangeStructureVerbMask.NodeAdded))
+        if parentdata is not None:
+            self._aspace.record_model_change(
+                item.ParentNodeId,
+                int(ua.ModelChangeStructureVerbMask.ReferenceAdded),
+                ref_target=nodedata.nodeid,
+            )
+
         return result
 
     def _add_node_attributes(self, nodedata: NodeData, item: ua.AddNodesItem, add_timestamps: bool) -> None:
@@ -414,8 +437,9 @@ class NodeManagementService:
         self, deletenodeitems: ua.DeleteNodesParameters, user: User = User(role=UserRole.Admin)
     ) -> list[ua.StatusCode]:
         results: list[ua.StatusCode] = []
-        for item in deletenodeitems.NodesToDelete:
-            results.append(self._delete_node(item, user))
+        with self._aspace.model_change_transaction():
+            for item in deletenodeitems.NodesToDelete:
+                results.append(self._delete_node(item, user))
         return results
 
     def _delete_node(self, item: ua.DeleteNodesItem, user: User) -> ua.StatusCode:
@@ -426,13 +450,28 @@ class NodeManagementService:
             self.logger.warning("DeleteNodesItem: NodeId %s does not exists", item.NodeId)
             return ua.StatusCode(ua.StatusCodes.BadNodeIdUnknown)
 
+        nodedata = self._aspace[item.NodeId]
+        had_node_version = self._aspace.node_has_node_version(item.NodeId)
+        affected_type = self._aspace._model_change_affected_type(item.NodeId, _CollectedModelChange())
         if item.DeleteTargetReferences:
             for elem in self._aspace.keys():
                 for rdesc in self._aspace[elem].references[:]:
                     if rdesc.NodeId == item.NodeId:
                         self._aspace[elem].references.remove(rdesc)
+                        self._aspace.record_model_change(
+                            elem,
+                            int(ua.ModelChangeStructureVerbMask.ReferenceDeleted),
+                            ref_target=item.NodeId,
+                        )
 
-        self._delete_node_callbacks(self._aspace[item.NodeId])
+        self._aspace.record_model_change(
+            item.NodeId,
+            int(ua.ModelChangeStructureVerbMask.NodeDeleted),
+            affected_type=affected_type,
+            had_node_version=had_node_version,
+        )
+
+        self._delete_node_callbacks(nodedata)
 
         del self._aspace[item.NodeId]
 
@@ -452,7 +491,8 @@ class NodeManagementService:
     def add_references(
         self, refs: list[ua.AddReferencesItem], user: User = User(role=UserRole.Admin)
     ) -> list[ua.StatusCode]:
-        result = [self._add_reference(ref, user) for ref in refs]
+        with self._aspace.model_change_transaction():
+            result = [self._add_reference(ref, user) for ref in refs]
         return result
 
     def try_add_references(
@@ -470,9 +510,11 @@ class NodeManagementService:
             return ua.StatusCode(ua.StatusCodes.BadTargetNodeIdInvalid)
         if user.role != UserRole.Admin:
             return ua.StatusCode(ua.StatusCodes.BadUserAccessDenied)
-        return self._add_reference_no_check(sourcedata, addref)
+        return self._add_reference_no_check(sourcedata, addref, record_change=True)
 
-    def _add_reference_no_check(self, sourcedata: NodeData, addref: ua.AddReferencesItem) -> ua.StatusCode:
+    def _add_reference_no_check(
+        self, sourcedata: NodeData, addref: ua.AddReferencesItem, record_change: bool = False
+    ) -> ua.StatusCode:
         rdesc = ua.ReferenceDescription()
         rdesc.ReferenceTypeId = addref.ReferenceTypeId
         rdesc.IsForward = addref.IsForward
@@ -498,14 +540,25 @@ class NodeManagementService:
                     if target_ref.IsForward and target_ref.ReferenceTypeId == ua.NodeId(ua.ObjectIds.HasTypeDefinition):
                         rdesc.TypeDefinition = target_ref.NodeId
                         break
-        return self._add_unique_reference(sourcedata, rdesc)
+        reference_existed = any(
+            ref.ReferenceTypeId == rdesc.ReferenceTypeId and ref.NodeId == rdesc.NodeId for ref in sourcedata.references
+        )
+        result = self._add_unique_reference(sourcedata, rdesc)
+        if record_change and result.is_good() and not reference_existed:
+            self._aspace.record_model_change(
+                addref.SourceNodeId,
+                int(ua.ModelChangeStructureVerbMask.ReferenceAdded),
+                ref_target=addref.TargetNodeId,
+            )
+        return result
 
     def delete_references(
         self, refs: list[ua.DeleteReferencesItem], user: User = User(role=UserRole.Admin)
     ) -> list[ua.StatusCode]:
         result: list[ua.StatusCode] = []
-        for ref in refs:
-            result.append(self._delete_reference(ref, user))
+        with self._aspace.model_change_transaction():
+            for ref in refs:
+                result.append(self._delete_reference(ref, user))
         return result
 
     def _delete_unique_reference(self, item: ua.DeleteReferencesItem, invert: bool = False) -> ua.StatusCode:
@@ -517,6 +570,11 @@ class NodeManagementService:
             if rdesc.NodeId == target and rdesc.ReferenceTypeId == item.ReferenceTypeId:
                 if rdesc.IsForward == forward:
                     self._aspace[source].references.remove(rdesc)
+                    self._aspace.record_model_change(
+                        source,
+                        int(ua.ModelChangeStructureVerbMask.ReferenceDeleted),
+                        ref_target=target,
+                    )
                     return ua.StatusCode()
         return ua.StatusCode(ua.StatusCodes.BadNotFound)
 
@@ -661,6 +719,11 @@ class AddressSpace:
         self._handle_to_attribute_map: dict[int, tuple[ua.NodeId, ua.AttributeIds]] = {}
         self._default_idx = 2
         self._nodeid_counter = {0: 20000, 1: 2000}
+        self._model_changes_stack: contextvars.ContextVar[list[dict[ua.NodeId, _CollectedModelChange]] | None] = (
+            contextvars.ContextVar("model_changes_stack", default=None)
+        )
+        self.model_change_sink: "Callable[[list[ua.ModelChangeStructureDataType]], Any] | None" = None
+        self._model_change_tasks: set[asyncio.Task[None]] = set()
 
     def __getitem__(self, nodeid: ua.NodeId) -> NodeData:
         return self._nodes.__getitem__(nodeid)
@@ -829,6 +892,14 @@ class AddressSpace:
             # Only check datatype if no bad StatusCode is set
             return ua.StatusCode(ua.StatusCodes.BadTypeMismatch)
 
+        data_type_changed = False
+        if attr == ua.AttributeIds.DataType:
+            old_data_type = (
+                attval.value.Value.Value if attval.value is not None and attval.value.Value is not None else None
+            )
+            new_data_type = value.Value.Value if value.Value is not None else None
+            data_type_changed = old_data_type != new_data_type
+
         if attval.value_setter is not None:
             attval.value_setter(node, attr, value)
         else:
@@ -837,6 +908,9 @@ class AddressSpace:
 
         if attr in (ua.AttributeIds.BrowseName, ua.AttributeIds.DisplayName):
             self._sync_reference_names(nodeid, node, attr, value)
+
+        if data_type_changed:
+            self.record_model_change(nodeid, int(ua.ModelChangeStructureVerbMask.DataTypeChanged))
 
         for k, v in attval.datachange_callbacks.items():
             try:
@@ -959,3 +1033,189 @@ class AddressSpace:
         node = self._nodes[methodid]
         node.call = callback
         return ua.StatusCode()
+
+    @contextlib.contextmanager
+    def model_change_transaction(
+        self,
+    ) -> "Generator[dict[ua.NodeId, _CollectedModelChange], None, None]":
+        stack = self._model_changes_stack.get()
+        token: contextvars.Token[list[dict[ua.NodeId, _CollectedModelChange]] | None] | None = None
+        if stack is None:
+            stack = []
+            token = self._model_changes_stack.set(stack)
+        collector: dict[ua.NodeId, _CollectedModelChange] = {}
+        stack.append(collector)
+        try:
+            yield collector
+        except BaseException:
+            stack.pop()
+            if token is not None:
+                self._model_changes_stack.reset(token)
+            raise
+        stack.pop()
+        if token is not None:
+            self._model_changes_stack.reset(token)
+            self._commit_model_changes(collector)
+        elif collector:
+            self._merge_collected_model_changes(stack[-1], collector)
+
+    @staticmethod
+    def _merge_collected_model_changes(
+        parent: dict[ua.NodeId, _CollectedModelChange],
+        child: dict[ua.NodeId, _CollectedModelChange],
+    ) -> None:
+        for nodeid, entry in child.items():
+            existing = parent.get(nodeid)
+            if existing is None:
+                parent[nodeid] = entry
+                continue
+            existing.verb |= entry.verb
+            existing.ref_targets.update(entry.ref_targets)
+            if entry.affected_type is not None:
+                existing.affected_type = entry.affected_type
+            if entry.had_node_version:
+                existing.had_node_version = True
+
+    def record_model_change(
+        self,
+        affected: ua.NodeId,
+        verb: int,
+        ref_target: ua.NodeId | None = None,
+        affected_type: ua.NodeId | None = None,
+        had_node_version: bool | None = None,
+    ) -> None:
+        if self.model_change_sink is None:
+            return
+        stack = self._model_changes_stack.get()
+        if stack is None:
+            with self.model_change_transaction() as collector:
+                self._merge_model_change(collector, affected, verb, ref_target, affected_type, had_node_version)
+        else:
+            self._merge_model_change(stack[-1], affected, verb, ref_target, affected_type, had_node_version)
+
+    @staticmethod
+    def _merge_model_change(
+        collector: dict[ua.NodeId, _CollectedModelChange],
+        affected: ua.NodeId,
+        verb: int,
+        ref_target: ua.NodeId | None,
+        affected_type: ua.NodeId | None,
+        had_node_version: bool | None,
+    ) -> None:
+        entry = collector.get(affected)
+        if entry is None:
+            entry = _CollectedModelChange()
+            collector[affected] = entry
+        entry.verb |= verb
+        if ref_target is not None:
+            entry.ref_targets.add(ref_target)
+        if affected_type is not None:
+            entry.affected_type = affected_type
+        if had_node_version is not None:
+            entry.had_node_version = had_node_version
+
+    def _commit_model_changes(self, collector: dict[ua.NodeId, _CollectedModelChange]) -> None:
+        sink = self.model_change_sink
+        if sink is None or not collector:
+            return
+        changes, versioned_nodeids = self._build_model_changes(collector)
+        if not changes:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._dispatch_model_changes(sink, changes, versioned_nodeids))
+        self._model_change_tasks.add(task)
+        task.add_done_callback(self._model_change_tasks.discard)
+
+    async def _dispatch_model_changes(
+        self,
+        sink: "Callable[[list[ua.ModelChangeStructureDataType]], Any]",
+        changes: list[ua.ModelChangeStructureDataType],
+        versioned_nodeids: list[ua.NodeId],
+    ) -> None:
+        try:
+            for nodeid in versioned_nodeids:
+                await self.bump_node_version(nodeid)
+            result = sink(changes)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            self.logger.exception("Error while dispatching GeneralModelChangeEvent")
+
+    def _build_model_changes(
+        self, collector: dict[ua.NodeId, _CollectedModelChange]
+    ) -> tuple[list[ua.ModelChangeStructureDataType], list[ua.NodeId]]:
+        versioned: dict[ua.NodeId, bool] = {}
+        for nodeid, entry in collector.items():
+            if nodeid in self._nodes:
+                versioned[nodeid] = self.node_has_node_version(nodeid)
+            else:
+                versioned[nodeid] = entry.had_node_version
+        linked: set[ua.NodeId] = set()
+        reference_verbs = int(
+            ua.ModelChangeStructureVerbMask.ReferenceAdded | ua.ModelChangeStructureVerbMask.ReferenceDeleted
+        )
+        for nodeid, entry in collector.items():
+            if versioned[nodeid] and entry.verb & reference_verbs:
+                linked.update(entry.ref_targets)
+        changes: list[ua.ModelChangeStructureDataType] = []
+        versioned_nodeids: list[ua.NodeId] = []
+        for nodeid, entry in collector.items():
+            if not versioned[nodeid] and nodeid not in linked:
+                continue
+            changes.append(
+                ua.ModelChangeStructureDataType(
+                    Affected=nodeid,
+                    AffectedType=self._model_change_affected_type(nodeid, entry),
+                    Verb=entry.verb,
+                )
+            )
+            if versioned[nodeid]:
+                versioned_nodeids.append(nodeid)
+        changes.sort(key=lambda change: change.Affected.to_string())
+        versioned_nodeids.sort(key=lambda nodeid: nodeid.to_string())
+        return changes, versioned_nodeids
+
+    async def bump_node_version(self, nodeid: ua.NodeId) -> None:
+        property_nodeid = self.get_node_version_property(nodeid)
+        if property_nodeid is None:
+            return
+        datavalue = self.read_attribute_value(property_nodeid, ua.AttributeIds.Value)
+        current = datavalue.Value.Value if datavalue.Value is not None else None
+        try:
+            new_value = str(int(current) + 1)
+        except (TypeError, ValueError):
+            return
+        new_datavalue = ua.DataValue(
+            ua.Variant(new_value, ua.VariantType.String),
+            SourceTimestamp=datetime.now(timezone.utc),
+        )
+        await self.write_attribute_value(property_nodeid, ua.AttributeIds.Value, new_datavalue)
+
+    def _model_change_affected_type(self, nodeid: ua.NodeId, entry: _CollectedModelChange) -> ua.NodeId:
+        if entry.affected_type is not None:
+            return entry.affected_type
+        node = self._nodes.get(nodeid)
+        if node is not None:
+            for ref in node.references:
+                if ref.IsForward and ref.ReferenceTypeId == _HAS_TYPE_DEFINITION_NODEID:
+                    return ref.NodeId
+        return ua.NodeId()
+
+    def node_has_node_version(self, nodeid: ua.NodeId) -> bool:
+        return self.get_node_version_property(nodeid) is not None
+
+    def get_node_version_property(self, nodeid: ua.NodeId) -> ua.NodeId | None:
+        node = self._nodes.get(nodeid)
+        if node is None:
+            return None
+        for ref in node.references:
+            if (
+                ref.IsForward
+                and ref.ReferenceTypeId == _HAS_PROPERTY_NODEID
+                and ref.BrowseName == _NODE_VERSION_BROWSE_NAME
+            ):
+                return ref.NodeId
+        return None

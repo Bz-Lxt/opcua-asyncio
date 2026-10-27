@@ -5,10 +5,11 @@ High level interface to pure python OPC-UA server
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import math
 import socket
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -838,6 +839,15 @@ class Server:
 
     def unsubscribe_server_callback(self, event: CallbackType, handle: Callable[..., Any]) -> None:
         self.iserver.unsubscribe_server_callback(event, handle)
+
+    @contextlib.contextmanager
+    def model_change_transaction(self) -> Generator[None, None, None]:
+        """
+        Group address space modifications into a single compressed GeneralModelChangeEvent.
+        Only nodes carrying a NodeVersion property are reported, as defined in OPC 10000-3 §9.32
+        """
+        with self.iserver.model_change_transaction():
+            yield
 
     def link_method(self, node: Node, callback: Callable[..., Any]) -> None:
         """

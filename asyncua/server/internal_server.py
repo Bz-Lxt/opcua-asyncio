@@ -6,8 +6,11 @@ Can be used on server side or to implement binary/https opc-ua servers
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Callable
+import time
+import uuid
+from collections.abc import Callable, Generator
 from copy import copy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -104,6 +107,7 @@ class InternalServer:
         )
         self.current_time_node = Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus_CurrentTime))
         self.server_status_node = Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus))
+        self._model_change_event: Any = None
         self.time_task: asyncio.Task[None] | None = None
         self._time_task_stop = False
         self.match_discovery_endpoint_url: bool = True
@@ -232,11 +236,43 @@ class InternalServer:
             ua.ServerState.Running, ua.VariantType.Int32
         )
         await Node(self.isession, ua.NodeId(ua.ObjectIds.Server_ServerStatus_StartTime)).write_value(status.StartTime)
+        await self._setup_model_change_events()
         if not self.disabled_clock:
             self.time_task = asyncio.create_task(self._set_current_time_loop())
 
+    @contextlib.contextmanager
+    def model_change_transaction(self) -> Generator[None, None, None]:
+        with self.aspace.model_change_transaction():
+            yield
+
+    async def _setup_model_change_events(self) -> None:
+        evgen = EventGenerator(self.isession)
+        await evgen.init(ua.ObjectIds.GeneralModelChangeEventType, emitting_node=ua.ObjectIds.Server)
+        event = evgen.event
+        event.data_types["Changes"] = ua.VariantType.ExtensionObject
+        event.Changes = []
+        self._model_change_event = event
+        self.aspace.model_change_sink = self._trigger_model_change_event
+
+    async def _trigger_model_change_event(self, changes: list[ua.ModelChangeStructureDataType]) -> None:
+        if self._model_change_event is None or not changes:
+            return
+        event = copy(self._model_change_event)
+        event.Changes = changes
+        event.Message = ua.LocalizedText(event.SourceName)
+        event.EventId = ua.Variant(uuid.uuid4().hex.encode("utf-8"), ua.VariantType.ByteString)
+        event_time = datetime.now(timezone.utc)
+        event.Time = event_time
+        event.ReceiveTime = event_time
+        event.LocalTime = ua.uaprotocol_auto.TimeZoneDataType()
+        localtime = time.localtime(event_time.timestamp())
+        event.LocalTime.Offset = localtime.tm_gmtoff // 60
+        event.LocalTime.DaylightSavingInOffset = bool(localtime.tm_isdst != -1)
+        await self.isession.subscription_service.trigger_event(event)
+
     async def stop(self) -> None:
         self.logger.info("stopping internal server")
+        self.aspace.model_change_sink = None
         if self.time_task:
             self._time_task_stop = True
             await self.time_task
